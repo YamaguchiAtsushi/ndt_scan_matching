@@ -1,0 +1,26 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/yamaguchi-a/urg_ws/devel/include/**",
+        "/opt/ros/noetic/include/**",
+        "/home/yamaguchi-a/urg_ws/src/hokuyo_node/include/**",
+        "/home/yamaguchi-a/catkin_ws/src/lidar_clustering/include/**",
+        "/home/yamaguchi-a/catkin_ws/src/ndt_scan_matching/include/**",
+        "/home/yamaguchi-a/catkin_ws/src/waypoint_maker/include/**",
+        "/home/yamaguchi-a/catkin_ws/src/ypspur_test/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}
