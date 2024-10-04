@@ -3,6 +3,7 @@
 #include <geometry_msgs/Pose.h>
 #include <visualization_msgs/Marker.h>
 #include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
 #include <vector>
 #include <cmath>
 #include <limits>
@@ -22,55 +23,96 @@ private:
     ros::Publisher pose_publisher_;
     ros::Publisher marker_publisher_;
 
+    // グリッドサイズを定義
+    const double grid_size = 1.0; // 1メートルごとのグリッド
+
+
+    // NDTのためにグリッドを構築し、平均と共分散行列を計算する関数
+    void buildNDTGrid(const std::vector<Eigen::Vector2d>& points,
+                    std::map<std::pair<int, int>, std::vector<Eigen::Vector2d>>& grid_cells,
+                    std::map<std::pair<int, int>, Eigen::Vector2d>& grid_means,
+                    std::map<std::pair<int, int>, Eigen::Matrix2d>& grid_covariances) {
+        
+        // グリッドセルごとに点群を分類
+        for (const auto& point : points) {
+            int grid_x = static_cast<int>(point(0) / grid_size);
+            int grid_y = static_cast<int>(point(1) / grid_size);
+            grid_cells[{grid_x, grid_y}].push_back(point);
+        }
+
+        // 各グリッドセルごとに平均と分散を計算
+        for (auto& cell : grid_cells) {
+            const std::vector<Eigen::Vector2d>& cell_points = cell.second;
+            int num_points = cell_points.size();
+
+            // 平均の計算
+            Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+            for (const auto& point : cell_points) {
+                mean += point;
+            }
+            mean /= num_points;
+            grid_means[cell.first] = mean;
+
+            // 共分散行列の計算
+            Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+            for (const auto& point : cell_points) {
+                Eigen::Vector2d diff = point - mean;
+                covariance += diff * diff.transpose();
+            }
+            covariance /= num_points - 1;
+            grid_covariances[cell.first] = covariance;
+        }
+    }
+
     // NDTマッチングを実行する関数
-    void performNDT(const std::vector<Eigen::Vector2d>& input_points, const std::vector<Eigen::Vector2d>& target_points) {
+    //Eigen::Vector2d : double型の2次元のvector
+    //Eigen::Matrix3d : double型の3×3の行列
+    void performNDT(const std::vector<Eigen::Vector2d>& input_points, 
+                    const std::map<std::pair<int, int>, Eigen::Vector2d>& grid_means, 
+                    const std::map<std::pair<int, int>, Eigen::Matrix2d>& grid_covariances) {
+        
         Eigen::Matrix3d transformation = Eigen::Matrix3d::Identity();
         const int max_iterations = 30;
         const double epsilon = 1e-4;
 
-        // マッチング結果を格納するためのベクトル
-        std::vector<Eigen::Vector2d> transformed_points;
-
         for (int iter = 0; iter < max_iterations; ++iter) {
-            // 更新のための行列とベクトルを初期化
-            Eigen::Matrix2d H = Eigen::Matrix2d::Zero(); // 2x2行列に変更
-            Eigen::Vector2d b = Eigen::Vector2d::Zero(); // 2次元ベクトルに変更
+            Eigen::Matrix2d H = Eigen::Matrix2d::Zero();
+            Eigen::Vector2d b = Eigen::Vector2d::Zero();
             int corresponding_points_count = 0;
 
-            // KDTreeでの最近傍探索
-            for (const auto& source_point : input_points) { // input_pointsを使用
-                Eigen::Vector3d source_h = transformation * Eigen::Vector3d(source_point(0), source_point(1), 1.0);
+            for (const auto& source_point : input_points) {
+                Eigen::Vector3d source_h = Eigen::Vector3d(source_point(0), source_point(1), 1.0);
                 Eigen::Vector2d query(source_h(0), source_h(1));
 
-                double min_dist = std::numeric_limits<double>::max();
-                Eigen::Vector2d closest_target;
+                // 点をグリッドにマッピング
+                int grid_x = static_cast<int>(query(0) / grid_size);
+                int grid_y = static_cast<int>(query(1) / grid_size);
+                std::pair<int, int> grid_cell = {grid_x, grid_y};
 
-                for (const auto& target_point : target_points) {
-                    double dist = (query - target_point).norm();
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        closest_target = target_point;
+                // グリッドが存在するかチェック
+                if (grid_means.count(grid_cell) > 0 && grid_covariances.count(grid_cell) > 0) {
+                    const Eigen::Vector2d& mean = grid_means.at(grid_cell);
+                    const Eigen::Matrix2d& covariance = grid_covariances.at(grid_cell);
+                    
+                    Eigen::Vector2d error = query - mean;
+
+                    // 共分散行列の逆行列を使用して誤差を計算
+                    Eigen::Matrix2d inv_covariance = covariance.inverse();
+                    double mahalanobis_distance = error.transpose() * inv_covariance * error;
+
+                    if (mahalanobis_distance < 3.0) { // 距離の閾値（適切に調整）
+                        Eigen::Matrix2d J = -inv_covariance;
+                        H += J.transpose() * J;
+                        b += J.transpose() * error;
+                        corresponding_points_count++;
                     }
-                }
-
-                if (min_dist < 3.0) { // 最大距離の閾値
-                    Eigen::Vector2d error = closest_target - query;
-
-                    // ヘッセ行列Hとベクトルbの更新
-                    Eigen::Matrix2d J; // ジャコビ行列
-                    J << -1, 0,
-                         0, -1;
-                    H += J.transpose() * J;
-                    b += J.transpose() * error;
-                    corresponding_points_count++;
                 }
             }
 
-            // 更新量の計算
             if (corresponding_points_count > 0) {
-                Eigen::Vector2d delta = H.colPivHouseholderQr().solve(-b); // 2次元ベクトルの更新量
-                transformation *= expMap(delta); // expMapも修正が必要です
-                transformation(2, 2) = 1.0; // z成分は変更しない
+                Eigen::Vector2d delta = H.colPivHouseholderQr().solve(-b);
+                transformation *= expMap(delta);
+                transformation(2, 2) = 1.0;
 
                 if (delta.norm() < epsilon) {
                     ROS_INFO("NDT scan matching has converged");
@@ -79,21 +121,21 @@ private:
             }
         }
 
-        // 最終的なポーズを公開
+        // 最終的な結果のポーズを公開
         geometry_msgs::Pose pose;
         pose.position.x = transformation(0, 2);
         pose.position.y = transformation(1, 2);
-        pose.orientation.w = 1.0; // 回転なしの単純な例
-        pose_publisher_.publish(pose);
+        pose.orientation.w = 1.0;
 
-        // マッチング結果の点群を計算
-        for (const auto& point : input_points) { // input_pointsを使用
+        // 入力点を変換してマーカーを作成
+        std::vector<Eigen::Vector2d> transformed_points;
+        for (const auto& point : input_points) {
             Eigen::Vector3d transformed_point = transformation * Eigen::Vector3d(point(0), point(1), 1.0);
             transformed_points.push_back(Eigen::Vector2d(transformed_point(0), transformed_point(1)));
         }
 
-        // RVizにマーカーを表示
-        publishMarker(pose, input_points, transformed_points);
+        publishMarker(pose, input_points, transformed_points); // マーカーをパブリッシュ
+        pose_publisher_.publish(pose);
     }
 
     Eigen::Matrix3d expMap(const Eigen::Vector2d& v) {
@@ -165,7 +207,7 @@ private:
             }
         }
 
-        // 例: 固定のターゲットポイントを設定する
+        // ターゲット点の設定
         std::vector<Eigen::Vector2d> target_points = {
             Eigen::Vector2d(1.0, 0.0),
             Eigen::Vector2d(0.0, 1.0),
@@ -173,8 +215,35 @@ private:
             Eigen::Vector2d(0.0, -1.0)
         };
 
+        // グリッド内の平均と共分散を計算するための準備
+        std::map<std::pair<int, int>, Eigen::Matrix<double, 2, 1>> mean_map;
+        std::map<std::pair<int, int>, Eigen::Matrix<double, 2, 2>> covariance_map;
+
+        // グリッドのサイズや分割数を決定するための変数
+        const int grid_size = 10; // 例: 10x10のグリッド
+        const double cell_size = 0.5; // セルのサイズ
+
+        // 入力点をグリッドに振り分ける
+        for (const auto& point : input_points) {
+            int grid_x = static_cast<int>(point(0) / cell_size);
+            int grid_y = static_cast<int>(point(1) / cell_size);
+            std::pair<int, int> grid_key = std::make_pair(grid_x, grid_y);
+
+            // 平均と共分散の更新
+            if (mean_map.find(grid_key) == mean_map.end()) {
+                mean_map[grid_key] = Eigen::Matrix<double, 2, 1>::Zero();
+                covariance_map[grid_key] = Eigen::Matrix<double, 2, 2>::Zero();
+            }
+
+            mean_map[grid_key] += point; // 平均に加算
+            covariance_map[grid_key](0, 0) += point(0) * point(0);
+            covariance_map[grid_key](0, 1) += point(0) * point(1);
+            covariance_map[grid_key](1, 0) += point(1) * point(0);
+            covariance_map[grid_key](1, 1) += point(1) * point(1);
+        }
+
         // NDTマッチングを実行
-        performNDT(input_points, target_points);
+        performNDT(input_points, mean_map, covariance_map);
     }
 };
 
